@@ -55,6 +55,17 @@ class BoltzDiffusionParams:
     alignment_reverse_diff: bool = True
     synchronize_sigmas: bool = True
     use_inference_model_cache: bool = True
+    density_map: str = None
+    aligned_model: str = None
+    global_scale: tuple = (0.25, 0.05)
+    global_steps: tuple = (101, 150)
+    local_scale: tuple = (0.5, 0.5)
+    local_steps: tuple = (151, 175)
+    res: float = 2.0
+    thresh: float = 0.0
+    dust: int = 5
+    cloud_size: float = 0.25
+    voxel_batch: int = 32768
 
 
 @rank_zero_only
@@ -500,6 +511,18 @@ def cli() -> None:
     help="Whether to dump the pde into a npz file. Default is False.",
 )
 @click.option(
+    "--write_traj",
+    type=bool,
+    is_flag=True,
+    help="Whether to dump the intermediate structures into XTC trajectories. Default is False.",
+)
+@click.option(
+    "--write_guidance_loss",
+    type=bool,
+    is_flag=True,
+    help="Whether to dump the guidance losses into an npz file. Default is False.",
+)
+@click.option(
     "--output_format",
     type=click.Choice(["pdb", "mmcif"]),
     help="The output format to use for the predictions. Default is mmcif.",
@@ -539,6 +562,86 @@ def cli() -> None:
     help="Pairing strategy to use. Used only if --use_msa_server is set. Options are 'greedy' and 'complete'",
     default="greedy",
 )
+@click.option(
+    "--density_map",
+    type=click.Path(exists=True),
+    help="Path to MRC file for map guidance",
+)
+@click.option(
+    "--aligned_model",
+    type=click.Path(exists=True),
+    help="Path to initial CIF model for guidance",
+)
+@click.option(
+    "--global_scale",
+    type=float,
+    nargs=2,
+    help="The starting and ending strength of global guidance. " \
+    "Value at end must be lesser or equal to the start.",
+    default=(0.25, 0.05)
+)
+@click.option(
+    "--global_steps",
+    type=int,
+    nargs=2,
+    help="1-indexed step range to activate density guidance (-1 for last step)",
+    default=(101, 150),
+)
+@click.option(
+    "--no_global",
+    is_flag=True,
+    help="Turn off global guidance",
+)
+@click.option(
+    "--local_scale",
+    type=float,
+    nargs=2,
+    help="The starting and ending strength of the local guidance" \
+        "Value at end must be lesser or equal to the start.",
+    default=(0.5, 0.5),
+)
+@click.option(
+    "--local_steps",
+    type=int,
+    nargs=2,
+    help="1-indexed step range to activate local guidance (-1 for last step)",
+    default=(151, 175),
+)
+@click.option(
+    "--no_local",
+    is_flag=True,
+    help="Turn off local guidance",
+)
+@click.option(
+    "--res",
+    type=float,
+    help="Estimated resolution of density map",
+    default=2.0,
+)
+@click.option(
+    "--thresh",
+    type=float,
+    help="Zero out map values below this threshold during global guidance",
+    default=0.0,
+)
+@click.option(
+    "--dust",
+    type=int,
+    help="Remove connected components of the map below this voxel count during global guidance",
+    default=5,
+)
+@click.option(
+    "--cloud_size",
+    type=float,
+    help="Scaling factor for size of point cloud during global guidance",
+    default=0.25,
+)
+@click.option(
+    "--voxel_batch",
+    type=int,
+    help="Number of voxels to process simultaneously during local guidance",
+    default=32768,
+)
 def predict(
     data: str,
     out_dir: str,
@@ -552,6 +655,8 @@ def predict(
     step_scale: float = 1.638,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
+    write_traj: bool = False,
+    write_guidance_loss: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
     num_workers: int = 2,
     override: bool = False,
@@ -559,6 +664,19 @@ def predict(
     use_msa_server: bool = False,
     msa_server_url: str = "https://api.colabfold.com",
     msa_pairing_strategy: str = "greedy",
+    density_map: Optional[str] = None,
+    aligned_model: Optional[str] = None,
+    global_scale: list[int] = (0.25, 0.05),
+    global_steps: list[int] = (101, 150),
+    no_global: bool = False,
+    local_scale: list[int] = (0.5, 0.5),
+    local_steps: list[int] = (151, 175),
+    no_local: bool = False,
+    res: float = 2.0,
+    thresh: float = 0.0,
+    dust: int = 5,
+    cloud_size: float = 0.25,
+    voxel_batch: int = 32768,
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -594,6 +712,14 @@ def predict(
     if not data:
         click.echo("No predictions to run, exiting.")
         return
+    
+    guidance = False
+    if density_map is not None:
+        assert aligned_model is not None, \
+            "Map guidance requires an aligned initial structure"
+        assert not (no_global and no_local), \
+            "At least one of global or local guidance must be specified"
+        guidance = True
 
     # Set up trainer
     strategy = "auto"
@@ -650,9 +776,35 @@ def predict(
         "write_confidence_summary": True,
         "write_full_pae": write_full_pae,
         "write_full_pde": write_full_pde,
+        "write_traj": write_traj,
+        "write_guidance_loss": write_guidance_loss,
     }
+    
     diffusion_params = BoltzDiffusionParams()
     diffusion_params.step_scale = step_scale
+    if guidance:
+        diffusion_params.density_map = density_map
+        diffusion_params.aligned_model = aligned_model
+        diffusion_params.thresh = thresh
+        diffusion_params.dust = dust
+        diffusion_params.cloud_size = cloud_size
+        diffusion_params.res = res
+        diffusion_params.voxel_batch = voxel_batch
+        if not no_global:
+            assert global_scale[0] >= global_scale[1]    
+            diffusion_params.global_scale = global_scale
+            end = global_steps[1] if global_steps[1] != -1 else sampling_steps
+            diffusion_params.global_steps = (global_steps[0], end)
+            assert diffusion_params.global_steps[0] <= diffusion_params.global_steps[1]
+        else: diffusion_params.global_steps = None
+        if not no_local:
+            assert local_scale[0] >= local_scale[1]    
+            diffusion_params.local_scale = local_scale
+            end = local_steps[1] if local_steps[1] != -1 else sampling_steps
+            diffusion_params.local_steps = (local_steps[0], end)
+            assert diffusion_params.local_steps[0] <= diffusion_params.local_steps[1]
+        else: diffusion_params.local_steps = None
+
     model_module: Boltz1 = Boltz1.load_from_checkpoint(
         checkpoint,
         strict=True,
@@ -677,6 +829,7 @@ def predict(
         accelerator=accelerator,
         devices=devices,
         precision=32,
+        inference_mode=(not guidance)
     )
 
     # Compute predictions

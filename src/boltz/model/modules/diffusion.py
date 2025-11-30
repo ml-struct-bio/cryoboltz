@@ -31,10 +31,15 @@ from boltz.model.modules.transformers import (
 from boltz.model.modules.utils import (
     LinearNoBias,
     center_random_augmentation,
+    apply_transform,
     default,
     log,
 )
-
+from boltz.model.modules.guidance import (
+    init_guidance, 
+    compute_guidance, 
+    schedule_guidance,
+)
 
 class DiffusionModule(Module):
     """Diffusion module"""
@@ -303,6 +308,17 @@ class AtomDiffusion(Module):
         synchronize_sigmas=False,
         use_inference_model_cache=False,
         accumulate_token_repr=False,
+        density_map=None,
+        aligned_model=None,
+        global_scale=(0.25, 0.05),
+        global_steps=(101, 150),
+        local_scale=(0.5, 0.5),
+        local_steps=(151, 175),
+        res=2.0,
+        thresh=0.0,
+        dust=5,
+        cloud_size=0.25,
+        voxel_batch=32768,
         **kwargs,
     ):
         """Initialize the atom diffusion module.
@@ -345,7 +361,35 @@ class AtomDiffusion(Module):
             Whether to use the inference model cache, by default False.
         accumulate_token_repr : bool, optional
             Whether to accumulate the token representation, by default False.
-
+        density_map : str, optional
+            MRC file of cryo-EM map for guidance.
+        aligned_model : str, optional
+            PDB/CIF file of a map-aligned structure for sample alignment 
+            during guidance.
+        global_scale : tuple(float, float), optional
+            Starting and ending guidance strength during global guidance. 
+            By default 0.25 to 0.05.
+        global_steps : tuple(int, int), optional
+            1-indexed diffusion timesteps for global guidance. 
+            By default 101 to 150.
+        local_scale : tuple(float, float), optional
+            Starting and ending guidance strength during local guidance. 
+            By default 0.5 to 0.5.
+        local_steps : tuple(int, int), optional
+            1-indexed diffusion timesteps for local guidance. 
+            By default 151 to 175.
+        res : float, optional
+            The nominal resolution of the input map. By default, 2.0.
+        thresh : float, optional
+            Map values below this value will be zeroed in global guidance. 
+            By default, 0.0.
+        dust : int, optional
+            Connected components of the map below this size will be removed 
+            during global guidance. By default, 5.
+        cloud_size: float, optional
+            Scaling factor for size of point cloud during global guidance.
+        voxel_batch: int, optional
+            Number of voxels to process simultaneously during local guidance.
         """
         super().__init__()
         self.score_model = DiffusionModule(
@@ -381,6 +425,24 @@ class AtomDiffusion(Module):
                 token_s=score_model_args["token_s"],
                 dim_fourier=score_model_args["dim_fourier"],
             )
+
+        self.density_map = density_map
+        self.aligned_model = aligned_model
+        self.guidance_scales = {
+            'global': global_scale,
+            'local': local_scale
+        }
+        self.guidance_steps = {
+            'global': global_steps,
+            'local': local_steps
+        }
+        self.map_params = {
+            'res': res,
+            'thresh': thresh,
+            'dust': dust,
+            'cloud_size': cloud_size,
+            'voxel_batch': voxel_batch
+        }
 
         self.register_buffer("zero", torch.tensor(0.0), persistent=False)
 
@@ -453,6 +515,7 @@ class AtomDiffusion(Module):
         train_accumulate_token_repr=False,
         **network_condition_kwargs,
     ):
+        print("Started structure sampling")
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
 
@@ -463,6 +526,20 @@ class AtomDiffusion(Module):
         gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
         sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
 
+        # initialize guidance
+        guidance = (self.density_map is not None)
+        if guidance:
+            guidance_inputs = {'density_map': self.density_map, 'aligned_model': self.aligned_model, 
+                                'map_params': self.map_params}
+            guidance_inputs['n_atoms'] = (atom_mask[0] > 0).sum().item()
+            guidance_inputs['pad'] = len(atom_mask[0]) - guidance_inputs['n_atoms']
+            guidance_inputs['sequence'] = network_condition_kwargs['feats']['res_type'][0].argmax(1).tolist()
+            guidance_types = [k for k, v in self.guidance_steps.items() if v is not None]
+            guidance_losses = {k: -torch.ones((num_sampling_steps, multiplicity), dtype=torch.float32) for k in guidance_types}
+            guidance_params = init_guidance(guidance_types, guidance_inputs, self.device)
+            guidance_start = min([self.guidance_steps[k][0] for k in guidance_types])
+            guidance_schedules = schedule_guidance(self.guidance_steps, self.guidance_scales)
+
         # atom position is noise at the beginning
         init_sigma = sigmas[0]
         atom_coords = init_sigma * torch.randn(shape, device=self.device)
@@ -471,19 +548,22 @@ class AtomDiffusion(Module):
 
         token_repr = None
         token_a = None
+        denoised_traj = torch.zeros((num_sampling_steps, *shape), dtype=torch.float32)
 
         # gradually denoise
-        for sigma_tm, sigma_t, gamma in sigmas_and_gammas:
-            atom_coords, atom_coords_denoised = center_random_augmentation(
+        for i, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
+            # random rotation and translation of input coords to denoiser
+            atom_coords, augment_params = center_random_augmentation(
                 atom_coords,
                 atom_mask,
                 augmentation=True,
-                return_second_coords=True,
-                second_coords=atom_coords_denoised,
+                centering=True,
+                ret_transform=True
             )
 
             sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
 
+            # add noise to sample
             t_hat = sigma_tm * (1 + gamma)
             eps = (
                 self.noise_scale
@@ -492,7 +572,19 @@ class AtomDiffusion(Module):
             )
             atom_coords_noisy = atom_coords + eps
 
-            with torch.no_grad():
+            # activate guidance terms for this step
+            if guidance:
+                guidance_current = []
+                for k in guidance_types:
+                    if self.guidance_steps[k][0] <= i+1 <= self.guidance_steps[k][1]:
+                        guidance_current.append(k)
+                    if self.guidance_steps[k][0] == i+1:
+                        print(f"Started {k} guidance")
+            guidance_this_step = (len(guidance_current) > 0) if guidance else False
+
+            with torch.set_grad_enabled(guidance_this_step):
+                # denoise the noisy coordinates
+                if guidance_this_step: atom_coords_noisy.requires_grad_(True)
                 atom_coords_denoised, token_a = self.preconditioned_network_forward(
                     atom_coords_noisy,
                     t_hat,
@@ -504,6 +596,22 @@ class AtomDiffusion(Module):
                     ),
                 )
 
+                # aligned noisy and denoised coordinates
+                if self.alignment_reverse_diff:
+                    with torch.autocast("cuda", enabled=False):
+                        atom_coords_denoised = weighted_rigid_align(
+                            atom_coords_denoised.float(),
+                            atom_coords_noisy.clone().float(),
+                            atom_mask.float(),
+                            atom_mask.float(),
+                            differentiable=guidance_this_step
+                        )
+
+            # compute unguided score term
+            with torch.no_grad():
+                denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
+
+            # compute inputs to confidence module
             if self.accumulate_token_repr:
                 if token_repr is None:
                     token_repr = torch.zeros_like(token_a)
@@ -518,26 +626,66 @@ class AtomDiffusion(Module):
                         times=self.c_noise(sigma), acc_a=token_repr, next_a=token_a
                     )
 
-            if self.alignment_reverse_diff:
-                with torch.autocast("cuda", enabled=False):
-                    atom_coords_noisy = weighted_rigid_align(
-                        atom_coords_noisy.float(),
-                        atom_coords_denoised.float(),
-                        atom_mask.float(),
-                        atom_mask.float(),
-                    )
+            # guidance step
+            with torch.set_grad_enabled(guidance_this_step):
+                # align denoised sample to the input structure when guidance starts, 
+                # afterwards undo the random transformations
+                if guidance:
+                    if i+1 == guidance_start:
+                        atom_coords_denoised, align_params = weighted_rigid_align(
+                            atom_coords_denoised.float(),
+                            guidance_params['ref_coords'].expand(*shape),
+                            atom_mask.float(),
+                            guidance_params['ref_mask'].expand(multiplicity, -1).int(),
+                            ret_transform=True,
+                            differentiable=True
+                        )
+                    elif i+1 > guidance_start:
+                        atom_coords_denoised = apply_transform(atom_coords_denoised, augment_params, invert=True)
 
-                atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
+                # compute guidance term, rescale magnitude, and add to the diffusion update
+                if guidance_this_step:
+                    guidance_params['curr_step'] = i 
+                    unguided_norm = torch.linalg.matrix_norm(denoised_over_sigma, keepdim=True).expand(*shape)
+                    for guidance_type in guidance_current:
+                        loss = compute_guidance(atom_coords_denoised, atom_mask, guidance_type, guidance_params)
+                        score = atom_coords_noisy.grad
+                        guided_norm = torch.linalg.matrix_norm(score, keepdim=True).expand(*shape)
+                        update_mask = (guided_norm > 0.)
+                        score[update_mask] *= unguided_norm[update_mask] / guided_norm[update_mask]
+                        guidance_scale = guidance_schedules[guidance_type][i]
+                        denoised_over_sigma += guidance_scale * score
+                        guidance_losses[guidance_type][i] = loss.detach().cpu()
+                    atom_coords_noisy.requires_grad_(False)
 
-            denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
-            atom_coords_next = (
+            # take diffusion step on samples
+            atom_coords = (
                 atom_coords_noisy
                 + self.step_scale * (sigma_t - t_hat) * denoised_over_sigma
             )
 
-            atom_coords = atom_coords_next
+            # bring noisy samples into alignment with map
+            if guidance:
+                if i+1 == guidance_start:    
+                    atom_coords = apply_transform(atom_coords, align_params)
+                elif i+1 > guidance_start:
+                    atom_coords = apply_transform(atom_coords, augment_params, invert=True)
+            
+            denoised_traj[i, ...] = atom_coords_denoised.detach().cpu()
 
-        return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+        # move samples back to original centering
+        if guidance and 'ref_center' in guidance_params:
+            atom_coords += guidance_params['ref_center'].to(atom_coords)
+            denoised_traj += guidance_params['ref_center'].to(denoised_traj)
+        
+        print("Finished structure sampling")
+        outputs = {
+            'sample_atom_coords': atom_coords, 
+            'diff_token_repr': token_repr,
+            'denoised_traj': denoised_traj,
+        }
+        if guidance: outputs['guidance_loss'] = guidance_losses
+        return outputs
 
     def loss_weight(self, sigma):
         return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)

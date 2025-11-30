@@ -43,9 +43,9 @@ def randomly_rotate(coords, return_second_coords=False, second_coords=None):
             torch.einsum("bmd,bds->bms", second_coords, R)
             if second_coords is not None
             else None
-        )
+        ), R
 
-    return torch.einsum("bmd,bds->bms", coords, R)
+    return torch.einsum("bmd,bds->bms", coords, R), R
 
 
 def center_random_augmentation(
@@ -56,6 +56,7 @@ def center_random_augmentation(
     centering=True,
     return_second_coords=False,
     second_coords=None,
+    ret_transform=False,
 ):
     """Center and randomly augment the input coordinates.
 
@@ -71,13 +72,17 @@ def center_random_augmentation(
         Whether to add rotational and translational augmentation the input, by default True
     centering : bool, optional
         Whether to center the input, by default True
+    ret_transform : bool, optional
+        Whether to return the transformation parameters, by default False
 
     Returns
     -------
     Tensor
         The augmented atom coordinates.
-
+    dict('center': torch.Tensor, 'rot': torch.Tensor, 'trans': torch.Tensor)
+        Transformation parameters
     """
+    augment_params = {}
     if centering:
         atom_mean = torch.sum(
             atom_coords * atom_mask[:, :, None], dim=1, keepdim=True
@@ -87,9 +92,10 @@ def center_random_augmentation(
         if second_coords is not None:
             # apply same transformation also to this input
             second_coords = second_coords - atom_mean
+        augment_params['center'] = atom_mean
 
     if augmentation:
-        atom_coords, second_coords = randomly_rotate(
+        atom_coords, second_coords, random_rot = randomly_rotate(
             atom_coords, return_second_coords=True, second_coords=second_coords
         )
         random_trans = torch.randn_like(atom_coords[:, 0:1, :]) * s_trans
@@ -97,11 +103,33 @@ def center_random_augmentation(
 
         if second_coords is not None:
             second_coords = second_coords + random_trans
+        augment_params['rot'] = random_rot
+        augment_params['trans'] = random_trans
 
-    if return_second_coords:
-        return atom_coords, second_coords
+    ret_value = [atom_coords]
+    if return_second_coords: ret_value.append(second_coords)
+    if ret_transform: ret_value.append(augment_params)
+    return ret_value[0] if len(ret_value)==1 else tuple(ret_value)
 
-    return atom_coords
+
+def apply_transform(coords, transform, invert=False):
+    result = coords.clone()
+    if not invert:
+        if 'center' in transform:
+            result -= transform['center']
+        if 'rot' in transform:
+            result = torch.einsum("bmd,bds->bms", result, transform['rot'])
+        if 'trans' in transform:
+            result += transform['trans']
+    else:
+        if 'trans' in transform:
+            result -= transform['trans']
+        if 'rot' in transform:
+            rot_inv = transform['rot'].transpose(-2, -1)
+            result = torch.einsum("bmd,bds->bms", result, rot_inv)
+        if 'center' in transform:
+            result += transform['center']
+    return result
 
 
 class ExponentialMovingAverage:

@@ -1149,6 +1149,10 @@ class Boltz1(LightningModule):
                 pred_dict["pae"] = out["pae"]
             if self.predict_args.get("write_full_pde", False):
                 pred_dict["pde"] = out["pde"]
+            if self.predict_args.get("write_traj", False):
+                pred_dict["denoised_traj"] = out["denoised_traj"]
+            if self.predict_args.get("write_guidance_loss", False) and "guidance_loss" in out:
+                pred_dict["guidance_loss"] = out["guidance_loss"]
             return pred_dict
 
         except RuntimeError as e:  # catch out of memory exceptions

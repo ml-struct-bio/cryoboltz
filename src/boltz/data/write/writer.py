@@ -8,6 +8,7 @@ from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import BasePredictionWriter
 import torch
 from torch import Tensor
+import mdtraj as md
 
 from boltz.data.types import (
     Interface,
@@ -142,16 +143,16 @@ class BoltzWriter(BasePredictionWriter):
 
                 # Save the structure
                 if self.output_format == "pdb":
-                    path = struct_dir / f"{outname}.pdb"
-                    with path.open("w") as f:
+                    struct_path = struct_dir / f"{outname}.pdb"
+                    with struct_path.open("w") as f:
                         f.write(to_pdb(new_structure, plddts=plddts))
                 elif self.output_format == "mmcif":
-                    path = struct_dir / f"{outname}.cif"
-                    with path.open("w") as f:
+                    struct_path = struct_dir / f"{outname}.cif"
+                    with struct_path.open("w") as f:
                         f.write(to_mmcif(new_structure, plddts=plddts))
                 else:
-                    path = struct_dir / f"{outname}.npz"
-                    np.savez_compressed(path, **asdict(new_structure))
+                    struct_path = struct_dir / f"{outname}.npz"
+                    np.savez_compressed(struct_path, **asdict(new_structure))
 
                 # Save confidence summary
                 if "plddt" in prediction:
@@ -218,6 +219,25 @@ class BoltzWriter(BasePredictionWriter):
                         / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
                     np.savez_compressed(path, pde=pde.cpu().numpy())
+
+                if "denoised_traj" in prediction:
+                    path = str(
+                        struct_dir
+                        / f"traj_{record.id}_model_{idx_to_rank[model_idx]}.xtc"
+                    )
+                    top = md.load(str(struct_path)).topology
+                    coords = prediction["denoised_traj"][:, model_idx, pad_mask.bool().cpu()]
+                    coords /= 10.
+                    traj = md.Trajectory(coords.cpu().numpy(), topology=top)
+                    traj.save(path)
+
+                if "guidance_loss" in prediction:
+                    losses = {}
+                    for guidance_type, loss in prediction["guidance_loss"].items():
+                        losses[guidance_type] = loss.T.cpu().numpy()
+                    path = struct_dir / f"guidance_loss.npz"
+                    np.savez_compressed(path, **losses)
+
 
     def on_predict_epoch_end(
         self,

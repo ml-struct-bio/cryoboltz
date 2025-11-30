@@ -29,6 +29,13 @@ dependencies = [
     "biopython==1.84",
     "scipy==1.13.1",
     "numba==0.61.0",
+    "gemmi==0.7.4",
+    "pykeops==2.3",
+    "geomloss==0.2.6",
+    "connected-components-3d==3.26.1",
+    "OpenMM==8.4.0.post2",
+    "mdtraj==1.10.3",
+    "mrcfile==1.5.0"
 ]
 
 [project.scripts]

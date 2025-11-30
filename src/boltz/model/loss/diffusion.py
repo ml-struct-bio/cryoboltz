@@ -10,6 +10,8 @@ def weighted_rigid_align(
     pred_coords,
     weights,
     mask,
+    ret_transform=False,
+    differentiable=False,
 ):
     """Compute weighted alignment.
 
@@ -23,14 +25,19 @@ def weighted_rigid_align(
         The weights for alignment
     mask: torch.Tensor
         The atoms mask
+    ret_transform: bool, optional
+        Whether to return transformation parameters. Default is False
+    differentiable: bool, optional
+        Whether to compute gradients through this operation. Default is False
 
     Returns
     -------
     torch.Tensor
         Aligned coordinates
+    dict('center': torch.Tensor, 'rot': torch.Tensor, 'trans': torch.Tensor)
+        Transformation parameters
 
     """
-
     batch_size, num_points, dim = true_coords.shape
     weights = (mask * weights).unsqueeze(-1)
 
@@ -89,8 +96,11 @@ def weighted_rigid_align(
         einsum(true_coords_centered, rot_matrix, "b n i, b j i -> b n j")
         + pred_centroid
     )
-    aligned_coords.detach_()
+    if not differentiable: aligned_coords.detach_()
 
+    if ret_transform:
+        align_params = {'center': true_centroid, 'rot': rot_matrix.transpose(-2, -1), 'trans': pred_centroid}
+        return aligned_coords, align_params
     return aligned_coords
 
 
