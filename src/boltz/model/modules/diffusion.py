@@ -36,9 +36,19 @@ from boltz.model.modules.utils import (
     log,
 )
 from boltz.model.modules.guidance import (
-    init_guidance, 
-    compute_guidance, 
+    init_guidance,
+    init_multi_guidance,
+    compute_guidance,
     schedule_guidance,
+)
+from boltz.model.modules.coupling import (
+    estimate_flexibility_from_coords,
+    build_coupling_strength,
+    compute_coupling_gradient,
+)
+from boltz.model.modules.hierarchy import (
+    HierarchicalCouplingSchedule,
+    build_default_groups,
 )
 
 class DiffusionModule(Module):
@@ -319,6 +329,18 @@ class AtomDiffusion(Module):
         dust=5,
         cloud_size=0.25,
         voxel_batch=32768,
+        # Multi-conformation parameters
+        density_maps=None,
+        aligned_models=None,
+        coupling_base_strength=1.0,
+        coupling_min_strength=0.01,
+        coupling_schedule='cosine',
+        hierarchy_transitions=None,
+        hierarchy_groups=None,
+        hierarchy_group_strategy='pairs',
+        n_path_intermediates=10,
+        path_refinement_steps=5,
+        path_blend_weight=0.7,
         **kwargs,
     ):
         """Initialize the atom diffusion module.
@@ -362,34 +384,56 @@ class AtomDiffusion(Module):
         accumulate_token_repr : bool, optional
             Whether to accumulate the token representation, by default False.
         density_map : str, optional
-            MRC file of cryo-EM map for guidance.
+            MRC file of cryo-EM map for guidance (single-map mode).
         aligned_model : str, optional
-            PDB/CIF file of a map-aligned structure for sample alignment 
+            PDB/CIF file of a map-aligned structure for sample alignment
             during guidance.
         global_scale : tuple(float, float), optional
-            Starting and ending guidance strength during global guidance. 
+            Starting and ending guidance strength during global guidance.
             By default 0.25 to 0.05.
         global_steps : tuple(int, int), optional
-            1-indexed diffusion timesteps for global guidance. 
+            1-indexed diffusion timesteps for global guidance.
             By default 101 to 150.
         local_scale : tuple(float, float), optional
-            Starting and ending guidance strength during local guidance. 
+            Starting and ending guidance strength during local guidance.
             By default 0.5 to 0.5.
         local_steps : tuple(int, int), optional
-            1-indexed diffusion timesteps for local guidance. 
+            1-indexed diffusion timesteps for local guidance.
             By default 151 to 175.
         res : float, optional
             The nominal resolution of the input map. By default, 2.0.
         thresh : float, optional
-            Map values below this value will be zeroed in global guidance. 
+            Map values below this value will be zeroed in global guidance.
             By default, 0.0.
         dust : int, optional
-            Connected components of the map below this size will be removed 
+            Connected components of the map below this size will be removed
             during global guidance. By default, 5.
         cloud_size: float, optional
             Scaling factor for size of point cloud during global guidance.
         voxel_batch: int, optional
             Number of voxels to process simultaneously during local guidance.
+        density_maps : list[str], optional
+            List of MRC files for multi-conformation joint sampling.
+        aligned_models : list[str], optional
+            List of aligned CIF models, one per density map.
+        coupling_base_strength : float, optional
+            Maximum coupling strength for rigid regions. By default, 1.0.
+        coupling_min_strength : float, optional
+            Minimum coupling strength for flexible regions. By default, 0.01.
+        coupling_schedule : str, optional
+            How coupling decays over time: 'cosine', 'linear', 'constant'.
+        hierarchy_transitions : list[int], optional
+            Step indices for hierarchy level transitions.
+        hierarchy_groups : list[list[int]], optional
+            Conformation groupings for Level 1 coupling.
+        hierarchy_group_strategy : str, optional
+            Default grouping strategy if groups not specified.
+        n_path_intermediates : int, optional
+            Number of path intermediates for path inference.
+        path_refinement_steps : int, optional
+            Number of refinement iterations for path inference.
+        path_blend_weight : float, optional
+            Score network trust weight for path inference.
         """
         super().__init__()
         self.score_model = DiffusionModule(
@@ -443,6 +487,19 @@ class AtomDiffusion(Module):
             'cloud_size': cloud_size,
             'voxel_batch': voxel_batch
         }
+
+        # Multi-conformation parameters
+        self.density_maps = density_maps
+        self.aligned_models = aligned_models
+        self.coupling_base_strength = coupling_base_strength
+        self.coupling_min_strength = coupling_min_strength
+        self.coupling_schedule = coupling_schedule
+        self.hierarchy_transitions = hierarchy_transitions
+        self.hierarchy_groups = hierarchy_groups
+        self.hierarchy_group_strategy = hierarchy_group_strategy
+        self.n_path_intermediates = n_path_intermediates
+        self.path_refinement_steps = path_refinement_steps
+        self.path_blend_weight = path_blend_weight
 
         self.register_buffer("zero", torch.tensor(0.0), persistent=False)
 
@@ -685,6 +742,324 @@ class AtomDiffusion(Module):
             'denoised_traj': denoised_traj,
         }
         if guidance: outputs['guidance_loss'] = guidance_losses
+        return outputs
+
+    def sample_joint(
+        self,
+        atom_mask,
+        num_sampling_steps=None,
+        multiplicity=1,
+        **network_condition_kwargs,
+    ):
+        """Joint sampling of N conformations with coupling and hierarchical guidance.
+
+        Implements the Bayesian joint posterior sampling framework:
+        For each conformation i, the score update includes:
+          1. Boltz-1 prior score (denoiser)
+          2. Density guidance for map y_i (CryoBoltz)
+          3. Coupling term: sum_{j!=i} Lambda_{ij} (x_j - x_i)
+
+        The coupling strength varies over time via the hierarchical schedule:
+          Level 0 (early): all conformations coupled
+          Level 1 (middle): group-based coupling
+          Level 2 (late): independent sampling
+
+        Parameters
+        ----------
+        atom_mask : torch.Tensor
+            Atom mask, shape (batch, n_atoms).
+        num_sampling_steps : int, optional
+            Number of diffusion steps.
+        multiplicity : int, optional
+            Number of samples per conformation.
+        **network_condition_kwargs : dict
+            Arguments for the score network (s_trunk, z_trunk, etc.).
+
+        Returns
+        -------
+        dict
+            'sample_atom_coords': list of N tensors, each (multiplicity, n_atoms, 3)
+            'diff_token_repr': token representation (from last conformation)
+            'denoised_traj': list of N trajectory tensors
+            'guidance_loss': dict of per-conformation guidance losses
+            'coupling_history': per-step coupling strengths
+        """
+        assert self.density_maps is not None, \
+            "sample_joint requires density_maps (list of MRC paths)"
+        assert self.aligned_models is not None, \
+            "sample_joint requires aligned_models (list of CIF paths)"
+
+        n_conf = len(self.density_maps)
+        assert len(self.aligned_models) == n_conf, \
+            "Number of density maps and aligned models must match"
+
+        print(f"Started joint structure sampling for {n_conf} conformations")
+        num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
+        atom_mask_expanded = atom_mask.repeat_interleave(multiplicity, 0)
+        shape = (*atom_mask_expanded.shape, 3)
+
+        # Build sigma schedule (shared across all conformations)
+        sigmas = self.sample_schedule(num_sampling_steps)
+        gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
+
+        # Initialize per-conformation guidance
+        guidance_types = [k for k, v in self.guidance_steps.items() if v is not None]
+        guidance_schedules = schedule_guidance(self.guidance_steps, self.guidance_scales)
+        guidance_start = min([self.guidance_steps[k][0] for k in guidance_types])
+
+        # Build per-conformation guidance inputs
+        n_atoms = (atom_mask_expanded[0] > 0).sum().item()
+        pad = len(atom_mask_expanded[0]) - n_atoms
+        sequence = network_condition_kwargs['feats']['res_type'][0].argmax(1).tolist()
+
+        inputs_list = []
+        for idx in range(n_conf):
+            inputs = {
+                'density_map': self.density_maps[idx],
+                'aligned_model': self.aligned_models[idx],
+                'map_params': self.map_params,
+                'n_atoms': n_atoms,
+                'pad': pad,
+                'sequence': sequence,
+            }
+            inputs_list.append(inputs)
+
+        # Initialize multi-conformation guidance
+        all_guidance_params, shared_params = init_multi_guidance(
+            guidance_types, inputs_list, self.device
+        )
+
+        # Estimate flexibility from reference structures for coupling
+        flexibility = estimate_flexibility_from_coords(
+            shared_params['ref_coords_list'],
+            shared_params['ref_masks_list'],
+        )
+        coupling_strength = build_coupling_strength(
+            flexibility,
+            base_strength=self.coupling_base_strength,
+            min_strength=self.coupling_min_strength,
+        )
+
+        # Build hierarchical coupling schedule
+        groups = self.hierarchy_groups
+        if groups is None and n_conf > 2:
+            groups = build_default_groups(n_conf, self.hierarchy_group_strategy)
+
+        hierarchy = HierarchicalCouplingSchedule(
+            n_conformations=n_conf,
+            num_steps=num_sampling_steps,
+            level_transitions=self.hierarchy_transitions,
+            groups=groups,
+            strength_schedule=self.coupling_schedule,
+            base_strength=self.coupling_base_strength,
+        )
+
+        # Initialize per-conformation state
+        init_sigma = sigmas[0]
+        all_coords = [
+            init_sigma * torch.randn(shape, device=self.device)
+            for _ in range(n_conf)
+        ]
+        all_denoised_traj = [
+            torch.zeros((num_sampling_steps, *shape), dtype=torch.float32)
+            for _ in range(n_conf)
+        ]
+        all_guidance_losses = [
+            {k: -torch.ones((num_sampling_steps, multiplicity), dtype=torch.float32)
+             for k in guidance_types}
+            for _ in range(n_conf)
+        ]
+        coupling_history = torch.zeros(num_sampling_steps)
+
+        token_repr = None
+
+        # Main diffusion loop
+        for i, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
+            sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
+            t_hat = sigma_tm * (1 + gamma)
+
+            # Get coupling info for this step
+            partners_info = []
+            for c in range(n_conf):
+                p, s = hierarchy.get_active_partners(i, c)
+                partners_info.append((p, s))
+            coupling_history[i] = partners_info[0][1] if partners_info else 0.0
+
+            # Determine if any guidance is active
+            guidance_current = []
+            for k in guidance_types:
+                if self.guidance_steps[k][0] <= i + 1 <= self.guidance_steps[k][1]:
+                    guidance_current.append(k)
+                    if self.guidance_steps[k][0] == i + 1:
+                        print(f"Started {k} guidance at step {i+1}")
+            guidance_this_step = len(guidance_current) > 0
+
+            # Process each conformation
+            all_denoised_over_sigma = []
+            all_augment_params = []
+            all_align_params = [None] * n_conf
+
+            for c in range(n_conf):
+                atom_coords = all_coords[c]
+
+                # Random rotation and translation
+                atom_coords, augment_params = center_random_augmentation(
+                    atom_coords, atom_mask_expanded,
+                    augmentation=True, centering=True, ret_transform=True
+                )
+                all_augment_params.append(augment_params)
+
+                # Add noise
+                eps = (
+                    self.noise_scale
+                    * sqrt(t_hat ** 2 - sigma_tm ** 2)
+                    * torch.randn(shape, device=self.device)
+                )
+                atom_coords_noisy = atom_coords + eps
+
+                with torch.set_grad_enabled(guidance_this_step):
+                    if guidance_this_step:
+                        atom_coords_noisy.requires_grad_(True)
+
+                    # Denoise via score network (shared Boltz-1 model)
+                    model_cache = {} if self.use_inference_model_cache else None
+                    atom_coords_denoised, token_a = self.preconditioned_network_forward(
+                        atom_coords_noisy, t_hat,
+                        training=False,
+                        network_condition_kwargs=dict(
+                            multiplicity=multiplicity,
+                            model_cache=model_cache,
+                            **network_condition_kwargs,
+                        ),
+                    )
+
+                    # Alignment
+                    if self.alignment_reverse_diff:
+                        with torch.autocast("cuda", enabled=False):
+                            atom_coords_denoised = weighted_rigid_align(
+                                atom_coords_denoised.float(),
+                                atom_coords_noisy.clone().float(),
+                                atom_mask_expanded.float(),
+                                atom_mask_expanded.float(),
+                                differentiable=guidance_this_step
+                            )
+
+                # Compute unguided score
+                with torch.no_grad():
+                    denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
+
+                # Guidance alignment
+                gp = all_guidance_params[c]
+                with torch.set_grad_enabled(guidance_this_step):
+                    if i + 1 == guidance_start:
+                        atom_coords_denoised, align_p = weighted_rigid_align(
+                            atom_coords_denoised.float(),
+                            gp['ref_coords'].expand(*shape),
+                            atom_mask_expanded.float(),
+                            gp['ref_mask'].expand(multiplicity, -1).int(),
+                            ret_transform=True, differentiable=True
+                        )
+                        all_align_params[c] = align_p
+                    elif i + 1 > guidance_start:
+                        atom_coords_denoised = apply_transform(
+                            atom_coords_denoised, augment_params, invert=True
+                        )
+
+                    # Density guidance (per-conformation map)
+                    if guidance_this_step:
+                        gp['curr_step'] = i
+                        unguided_norm = torch.linalg.matrix_norm(
+                            denoised_over_sigma, keepdim=True
+                        ).expand(*shape)
+                        for guidance_type in guidance_current:
+                            loss = compute_guidance(
+                                atom_coords_denoised, atom_mask_expanded,
+                                guidance_type, gp
+                            )
+                            score = atom_coords_noisy.grad
+                            guided_norm = torch.linalg.matrix_norm(
+                                score, keepdim=True
+                            ).expand(*shape)
+                            update_mask = (guided_norm > 0.)
+                            score[update_mask] *= (
+                                unguided_norm[update_mask] / guided_norm[update_mask]
+                            )
+                            guidance_scale = guidance_schedules[guidance_type][i]
+                            denoised_over_sigma += guidance_scale * score
+                            all_guidance_losses[c][guidance_type][i] = loss.detach().cpu()
+                        atom_coords_noisy.requires_grad_(False)
+
+                all_denoised_over_sigma.append(denoised_over_sigma)
+                all_coords[c] = atom_coords_noisy  # temporarily store noisy coords
+
+                # Store denoised trajectory
+                all_denoised_traj[c][i, ...] = atom_coords_denoised.detach().cpu()
+
+            # Apply coupling gradients (Contribution 1 & 2)
+            # Uses all_denoised_traj at step i for the coupling targets
+            for c in range(n_conf):
+                active_partners, coupling_mult = partners_info[c]
+                if coupling_mult > 0 and len(active_partners) > 0:
+                    # Use denoised coordinates for coupling
+                    denoised_list = [
+                        all_denoised_traj[j][i].to(self.device)
+                        for j in range(n_conf)
+                    ]
+                    coupling_grad = compute_coupling_gradient(
+                        denoised_list, coupling_strength.to(self.device),
+                        c, atom_mask_expanded, active_indices=active_partners
+                    )
+                    # Scale coupling gradient to match score magnitude
+                    coupling_norm = torch.linalg.matrix_norm(
+                        coupling_grad, keepdim=True
+                    ).expand(*shape)
+                    score_norm = torch.linalg.matrix_norm(
+                        all_denoised_over_sigma[c], keepdim=True
+                    ).expand(*shape)
+                    norm_mask = (coupling_norm > 0.)
+                    if norm_mask.any():
+                        coupling_grad[norm_mask] *= (
+                            score_norm[norm_mask] / coupling_norm[norm_mask]
+                        )
+                    all_denoised_over_sigma[c] += coupling_mult * coupling_grad
+
+            # Take diffusion step for all conformations
+            for c in range(n_conf):
+                atom_coords_noisy = all_coords[c]
+                all_coords[c] = (
+                    atom_coords_noisy
+                    + self.step_scale * (sigma_t - t_hat) * all_denoised_over_sigma[c]
+                )
+
+                # Bring samples into map alignment
+                if i + 1 == guidance_start and all_align_params[c] is not None:
+                    all_coords[c] = apply_transform(all_coords[c], all_align_params[c])
+                elif i + 1 > guidance_start:
+                    all_coords[c] = apply_transform(
+                        all_coords[c], all_augment_params[c], invert=True
+                    )
+
+        # Move back to original centering
+        for c in range(n_conf):
+            ref_center = shared_params['ref_center'].to(all_coords[c])
+            all_coords[c] += ref_center
+            all_denoised_traj[c] += ref_center.to(all_denoised_traj[c])
+
+        print("Finished joint structure sampling")
+
+        outputs = {
+            'sample_atom_coords': all_coords[0],  # primary for compatibility
+            'all_sample_atom_coords': all_coords,
+            'diff_token_repr': token_repr,
+            'denoised_traj': all_denoised_traj[0],
+            'all_denoised_traj': all_denoised_traj,
+            'guidance_loss': {
+                f'conf_{c}': all_guidance_losses[c] for c in range(n_conf)
+            },
+            'coupling_history': coupling_history,
+            'n_conformations': n_conf,
+        }
         return outputs
 
     def loss_weight(self, sigma):

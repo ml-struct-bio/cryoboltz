@@ -19,8 +19,8 @@ def init_guidance(types, inputs, device):
 
     # load map
     params['map_generator'] = MapGenerator(
-        inputs['density_map'], 
-        inputs['sequence'], 
+        inputs['density_map'],
+        inputs['sequence'],
         nominal_res=inputs['map_params']['res'],
         ref_center=params['ref_center'],
         device=device
@@ -33,9 +33,9 @@ def init_guidance(types, inputs, device):
     if 'global' in types:
         cloud_points = int(inputs['map_params']['cloud_size'] * inputs['n_atoms'] // params['voxel_size']**3)
         params['density_cloud'] = kmeans_cloud(
-            params['density_map'], 
+            params['density_map'],
             params['voxel_size'],
-            params['origin'],   
+            params['origin'],
             params['ref_center'],
             cloud_points,
             weighted=True,
@@ -43,11 +43,101 @@ def init_guidance(types, inputs, device):
             dust=inputs['map_params']['dust'],
         )
         params['cloud_loss'] = SamplesLoss(reach=10)
-    
+
     if 'local' in types:
         params['vox_batch_size'] = inputs['map_params']['voxel_batch']
-        
+
     return params
+
+
+def init_multi_guidance(types, inputs_list, device):
+    """Initialize guidance for multiple density maps (multi-conformation mode).
+
+    Parameters
+    ----------
+    types : list[str]
+        Guidance types to initialize ('global', 'local').
+    inputs_list : list[dict]
+        List of input dicts, one per conformation. Each dict has the same
+        structure as the single-map inputs dict.
+    device : torch.device
+        Device to use.
+
+    Returns
+    -------
+    list[dict]
+        List of guidance params, one per conformation.
+    dict
+        Shared parameters (common ref_center computed as mean across maps).
+    """
+    n_conf = len(inputs_list)
+    all_params = []
+
+    # First pass: load all reference structures to compute shared center
+    ref_coords_list = []
+    ref_masks_list = []
+    for inputs in inputs_list:
+        coords, mask = load_cif(inputs['aligned_model'], inputs['sequence'], ca_only=True)
+        coords_padded = torch.nn.functional.pad(coords, (0, 0, 0, inputs['pad'])).to(device)
+        mask_padded = torch.nn.functional.pad(mask, (0, inputs['pad'])).to(device)
+        ref_coords_list.append(coords_padded)
+        ref_masks_list.append(mask_padded)
+
+    # Compute shared reference center (mean of all reference structures)
+    all_masked_coords = []
+    for coords, mask in zip(ref_coords_list, ref_masks_list):
+        all_masked_coords.append(coords[mask].mean(0))
+    shared_center = torch.stack(all_masked_coords).mean(0)
+
+    # Second pass: initialize per-conformation guidance with shared center
+    for idx, inputs in enumerate(inputs_list):
+        params = {}
+        params['ref_coords'] = ref_coords_list[idx]
+        params['ref_mask'] = ref_masks_list[idx]
+        params['ref_center'] = shared_center
+        params['ref_coords'][params['ref_mask']] -= shared_center
+
+        # Load map with shared center
+        params['map_generator'] = MapGenerator(
+            inputs['density_map'],
+            inputs['sequence'],
+            nominal_res=inputs['map_params']['res'],
+            ref_center=shared_center,
+            device=device
+        )
+        params['density_map'] = torch.tensor(params['map_generator'].density).to(device)
+        params['voxel_size'] = params['map_generator'].voxel_size
+        params['origin'] = params['map_generator'].origin.to(device)
+
+        if 'global' in types:
+            cloud_points = int(
+                inputs['map_params']['cloud_size'] * inputs['n_atoms']
+                // params['voxel_size'] ** 3
+            )
+            params['density_cloud'] = kmeans_cloud(
+                params['density_map'],
+                params['voxel_size'],
+                params['origin'],
+                shared_center,
+                cloud_points,
+                weighted=True,
+                thresh=inputs['map_params']['thresh'],
+                dust=inputs['map_params']['dust'],
+            )
+            params['cloud_loss'] = SamplesLoss(reach=10)
+
+        if 'local' in types:
+            params['vox_batch_size'] = inputs['map_params']['voxel_batch']
+
+        all_params.append(params)
+
+    shared_params = {
+        'ref_center': shared_center,
+        'ref_coords_list': ref_coords_list,
+        'ref_masks_list': ref_masks_list,
+    }
+
+    return all_params, shared_params
 
 
 # Cosine annealing guidance strength
@@ -63,7 +153,7 @@ def schedule_guidance(steps, scales):
             assert scales[t][0] >= scales[t][1], "Only decreasing scale is supported"
             step_idxs = torch.arange(end - start + 1)
             schedule[start-1:] = scales[t][1] + 0.5 * (scales[t][0]-scales[t][1]) \
-                * (1+torch.cos(np.pi*step_idxs/(end-start))) 
+                * (1+torch.cos(np.pi*step_idxs/(end-start)))
         schedules[t] = schedule
     return schedules
 
@@ -77,17 +167,17 @@ def compute_guidance(
     ):
     if guidance_type=='local':
         nll = density_mse_grad(
-            atom_coords, 
-            guidance_params['density_map'], 
-            guidance_params['map_generator'], (atom_mask > 0), 
-            guidance_params['map_generator'].nominal_res, 
+            atom_coords,
+            guidance_params['density_map'],
+            guidance_params['map_generator'], (atom_mask > 0),
+            guidance_params['map_generator'].nominal_res,
             guidance_params['vox_batch_size']
         )
     elif guidance_type=='global':
         nll = density_cloud_grad(
-            atom_coords, 
+            atom_coords,
             guidance_params['density_cloud'],
-            (atom_mask > 0), 
+            (atom_mask > 0),
             guidance_params['cloud_loss']
         )
     return nll

@@ -258,6 +258,7 @@ class Boltz1(LightningModule):
         multiplicity_diffusion_train: int = 1,
         diffusion_samples: int = 1,
         run_confidence_sequentially: bool = False,
+        multi_conformation: bool = False,
     ) -> dict[str, Tensor]:
         dict_out = {}
 
@@ -328,19 +329,35 @@ class Boltz1(LightningModule):
             )
 
         if (not self.training) or self.confidence_prediction:
-            dict_out.update(
-                self.structure_module.sample(
-                    s_trunk=s,
-                    z_trunk=z,
-                    s_inputs=s_inputs,
-                    feats=feats,
-                    relative_position_encoding=relative_position_encoding,
-                    num_sampling_steps=num_sampling_steps,
-                    atom_mask=feats["atom_pad_mask"],
-                    multiplicity=diffusion_samples,
-                    train_accumulate_token_repr=self.training,
+            if multi_conformation and self.structure_module.density_maps is not None:
+                # Multi-conformation joint sampling
+                dict_out.update(
+                    self.structure_module.sample_joint(
+                        s_trunk=s,
+                        z_trunk=z,
+                        s_inputs=s_inputs,
+                        feats=feats,
+                        relative_position_encoding=relative_position_encoding,
+                        num_sampling_steps=num_sampling_steps,
+                        atom_mask=feats["atom_pad_mask"],
+                        multiplicity=diffusion_samples,
+                    )
                 )
-            )
+            else:
+                # Standard single-map sampling
+                dict_out.update(
+                    self.structure_module.sample(
+                        s_trunk=s,
+                        z_trunk=z,
+                        s_inputs=s_inputs,
+                        feats=feats,
+                        relative_position_encoding=relative_position_encoding,
+                        num_sampling_steps=num_sampling_steps,
+                        atom_mask=feats["atom_pad_mask"],
+                        multiplicity=diffusion_samples,
+                        train_accumulate_token_repr=self.training,
+                    )
+                )
 
         if self.confidence_prediction:
             dict_out.update(
@@ -1117,16 +1134,29 @@ class Boltz1(LightningModule):
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Any:
         try:
+            multi_conf = self.predict_args.get("multi_conformation", False)
             out = self(
                 batch,
                 recycling_steps=self.predict_args["recycling_steps"],
                 num_sampling_steps=self.predict_args["sampling_steps"],
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 run_confidence_sequentially=True,
+                multi_conformation=multi_conf,
             )
             pred_dict = {"exception": False}
             pred_dict["masks"] = batch["atom_pad_mask"]
             pred_dict["coords"] = out["sample_atom_coords"]
+
+            # Multi-conformation outputs
+            if multi_conf and "all_sample_atom_coords" in out:
+                pred_dict["multi_conformation"] = True
+                pred_dict["n_conformations"] = out["n_conformations"]
+                pred_dict["all_coords"] = out["all_sample_atom_coords"]
+                if "all_denoised_traj" in out:
+                    pred_dict["all_denoised_traj"] = out["all_denoised_traj"]
+                if "coupling_history" in out:
+                    pred_dict["coupling_history"] = out["coupling_history"]
+
             if self.predict_args.get("write_confidence_summary", True):
                 pred_dict["confidence_score"] = (
                     4 * out["complex_plddt"] +

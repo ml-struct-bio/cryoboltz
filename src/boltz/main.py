@@ -66,6 +66,18 @@ class BoltzDiffusionParams:
     dust: int = 5
     cloud_size: float = 0.25
     voxel_batch: int = 32768
+    # Multi-conformation parameters
+    density_maps: list = None
+    aligned_models: list = None
+    coupling_base_strength: float = 1.0
+    coupling_min_strength: float = 0.01
+    coupling_schedule: str = 'cosine'
+    hierarchy_transitions: list = None
+    hierarchy_groups: list = None
+    hierarchy_group_strategy: str = 'pairs'
+    n_path_intermediates: int = 10
+    path_refinement_steps: int = 5
+    path_blend_weight: float = 0.7
 
 
 @rank_zero_only
@@ -642,6 +654,63 @@ def cli() -> None:
     help="Number of voxels to process simultaneously during local guidance",
     default=32768,
 )
+# Multi-conformation options
+@click.option(
+    "--density_maps",
+    type=str,
+    multiple=True,
+    help="MRC files for multi-conformation joint sampling (provide multiple times, e.g., "
+         "--density_maps map1.mrc --density_maps map2.mrc)",
+)
+@click.option(
+    "--aligned_models",
+    type=str,
+    multiple=True,
+    help="Aligned CIF models for multi-conformation mode (one per density map)",
+)
+@click.option(
+    "--coupling_strength",
+    type=float,
+    help="Base coupling strength for rigid regions in multi-conformation mode",
+    default=1.0,
+)
+@click.option(
+    "--coupling_schedule",
+    type=click.Choice(["cosine", "linear", "constant"]),
+    help="How coupling strength decays over diffusion time",
+    default="cosine",
+)
+@click.option(
+    "--hierarchy_transitions",
+    type=int,
+    nargs=2,
+    help="Step indices for hierarchy level transitions (Level0->Level1, Level1->Level2)",
+    default=None,
+)
+@click.option(
+    "--hierarchy_group_strategy",
+    type=click.Choice(["pairs", "halves", "singles"]),
+    help="Default grouping strategy for Level 1 coupling",
+    default="pairs",
+)
+@click.option(
+    "--n_path_intermediates",
+    type=int,
+    help="Number of intermediate structures for path inference",
+    default=10,
+)
+@click.option(
+    "--path_refinement_steps",
+    type=int,
+    help="Number of refinement iterations for path inference",
+    default=5,
+)
+@click.option(
+    "--path_blend_weight",
+    type=float,
+    help="Score network trust weight for path inference (0-1)",
+    default=0.7,
+)
 def predict(
     data: str,
     out_dir: str,
@@ -677,6 +746,15 @@ def predict(
     dust: int = 5,
     cloud_size: float = 0.25,
     voxel_batch: int = 32768,
+    density_maps: tuple = (),
+    aligned_models: tuple = (),
+    coupling_strength: float = 1.0,
+    coupling_schedule: str = "cosine",
+    hierarchy_transitions: Optional[tuple] = None,
+    hierarchy_group_strategy: str = "pairs",
+    n_path_intermediates: int = 10,
+    path_refinement_steps: int = 5,
+    path_blend_weight: float = 0.7,
 ) -> None:
     """Run predictions with Boltz-1."""
     # If cpu, write a friendly warning
@@ -714,7 +792,19 @@ def predict(
         return
     
     guidance = False
-    if density_map is not None:
+    multi_conf = False
+    if len(density_maps) > 0:
+        # Multi-conformation mode
+        assert len(aligned_models) == len(density_maps), \
+            "Number of aligned models must match number of density maps"
+        assert len(density_maps) >= 2, \
+            "Multi-conformation mode requires at least 2 density maps"
+        assert not (no_global and no_local), \
+            "At least one of global or local guidance must be specified"
+        multi_conf = True
+        guidance = True
+        click.echo(f"Multi-conformation mode: jointly sampling {len(density_maps)} conformations")
+    elif density_map is not None:
         assert aligned_model is not None, \
             "Map guidance requires an aligned initial structure"
         assert not (no_global and no_local), \
@@ -778,32 +868,49 @@ def predict(
         "write_full_pde": write_full_pde,
         "write_traj": write_traj,
         "write_guidance_loss": write_guidance_loss,
+        "multi_conformation": multi_conf,
     }
     
     diffusion_params = BoltzDiffusionParams()
     diffusion_params.step_scale = step_scale
     if guidance:
-        diffusion_params.density_map = density_map
-        diffusion_params.aligned_model = aligned_model
+        # Shared guidance parameters
         diffusion_params.thresh = thresh
         diffusion_params.dust = dust
         diffusion_params.cloud_size = cloud_size
         diffusion_params.res = res
         diffusion_params.voxel_batch = voxel_batch
         if not no_global:
-            assert global_scale[0] >= global_scale[1]    
+            assert global_scale[0] >= global_scale[1]
             diffusion_params.global_scale = global_scale
             end = global_steps[1] if global_steps[1] != -1 else sampling_steps
             diffusion_params.global_steps = (global_steps[0], end)
             assert diffusion_params.global_steps[0] <= diffusion_params.global_steps[1]
         else: diffusion_params.global_steps = None
         if not no_local:
-            assert local_scale[0] >= local_scale[1]    
+            assert local_scale[0] >= local_scale[1]
             diffusion_params.local_scale = local_scale
             end = local_steps[1] if local_steps[1] != -1 else sampling_steps
             diffusion_params.local_steps = (local_steps[0], end)
             assert diffusion_params.local_steps[0] <= diffusion_params.local_steps[1]
         else: diffusion_params.local_steps = None
+
+        if multi_conf:
+            # Multi-conformation specific parameters
+            diffusion_params.density_maps = list(density_maps)
+            diffusion_params.aligned_models = list(aligned_models)
+            diffusion_params.coupling_base_strength = coupling_strength
+            diffusion_params.coupling_schedule = coupling_schedule
+            if hierarchy_transitions is not None:
+                diffusion_params.hierarchy_transitions = list(hierarchy_transitions)
+            diffusion_params.hierarchy_group_strategy = hierarchy_group_strategy
+            diffusion_params.n_path_intermediates = n_path_intermediates
+            diffusion_params.path_refinement_steps = path_refinement_steps
+            diffusion_params.path_blend_weight = path_blend_weight
+        else:
+            # Single-map mode
+            diffusion_params.density_map = density_map
+            diffusion_params.aligned_model = aligned_model
 
     model_module: Boltz1 = Boltz1.load_from_checkpoint(
         checkpoint,
